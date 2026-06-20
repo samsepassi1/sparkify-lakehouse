@@ -6,12 +6,18 @@ from airflow.datasets import Dataset as Asset
 from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
 from airflow.providers.common.sql.operators.sql import SQLCheckOperator
 
-AWS_CONN_ID = 'aws_default'
-ATHENA_CONN_ID = 'aws_default'
-S3_BUCKET_VAR = 'sparkify_bucket'
-RAW_ASSET = Asset('s3://sparkify/raw_complete')
-TRANSACTIONS_ASSET = Asset('s3://sparkify/transactions_complete')
-ANALYTICS_ASSET = Asset('s3://sparkify/analytics_complete')
+# ── Centralized constants ──────────────────────────────────────────
+AWS_CONN_ID     = 'aws_default'
+ATHENA_CONN_ID  = 'athena_default'
+S3_BUCKET_VAR   = 'sparkify_bucket'
+S3_BUCKET_TPL   = '{{ var.value.sparkify_bucket }}'
+GLUE_SCRIPTS    = 'glue-scripts'
+TRANSACTIONS_SCRIPT = f's3://{S3_BUCKET_TPL}/{GLUE_SCRIPTS}/transactions/glue_script.py'
+
+# ── Assets ─────────────────────────────────────────────────────────
+RAW_ASSET             = Asset('s3://sparkify/raw_complete')
+TRANSACTIONS_ASSET    = Asset('s3://sparkify/transactions_complete')
+ANALYTICS_ASSET       = Asset('s3://sparkify/analytics_complete')
 
 
 def interval_from_context(**context):
@@ -46,11 +52,11 @@ with DAG(
         op = GlueJobOperator(
             task_id=f'promote_{name}',
             job_name='sparkify-transactions',
-            script_location='s3://{{ var.value.sparkify_bucket }}/glue-scripts/transactions/glue_script.py',
+            script_location=TRANSACTIONS_SCRIPT,
             iam_role_name='GlueServiceRole',
             aws_conn_id=AWS_CONN_ID,
             script_args={
-                '--BUCKET': '{{ var.value.sparkify_bucket }}',
+                '--BUCKET': S3_BUCKET_TPL,
                 '--DATA_INTERVAL': '{{ ti.xcom_pull(task_ids="selected_interval") }}',
                 '--SQL_FILE': f'sql/{name}.sql',
                 '--TABLE_NAME': name,
@@ -63,7 +69,7 @@ with DAG(
             interval >> op
         prev = op
 
-    # SQL Check: verify transactions.events has no duplicate event_id
+    # ── SQL Checks using athena_default ──────────────────────────────
     check_events = SQLCheckOperator(
         task_id='check_events_dedup',
         conn_id=ATHENA_CONN_ID,
@@ -74,7 +80,6 @@ with DAG(
         """,
     )
 
-    # SQL Check: verify transactions.users is non-empty
     check_users = SQLCheckOperator(
         task_id='check_users_nonempty',
         conn_id=ATHENA_CONN_ID,
@@ -86,7 +91,7 @@ with DAG(
 
     @task(outlets=[TRANSACTIONS_ASSET])
     def emit_transactions(data_interval, *, outlet_events=None):
-        """Emit transactions asset with metadata attached to the asset event."""
+        """Emit transactions asset with both data_interval and tables."""
         payload = {'data_interval': data_interval, 'tables': SQL_ORDER}
         if outlet_events is not None:
             outlet_events[TRANSACTIONS_ASSET].extra = payload
