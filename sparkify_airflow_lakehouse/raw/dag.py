@@ -7,16 +7,22 @@ from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.common.sql.operators.sql import SQLCheckOperator
 
-AWS_CONN_ID = 'aws_default'
-ATHENA_CONN_ID = 'aws_default'
-S3_BUCKET_VAR = 'sparkify_bucket'
-LANDING_ROOT = 'landing'
-SCRIPTS_ROOT = 'glue-scripts'
-RAW_ASSET = Asset('s3://sparkify/raw_complete')
-TRANSACTIONS_ASSET = Asset('s3://sparkify/transactions_complete')
-ANALYTICS_ASSET = Asset('s3://sparkify/analytics_complete')
+# ── Centralized constants ──────────────────────────────────────────
+AWS_CONN_ID     = 'aws_default'
+ATHENA_CONN_ID  = 'athena_default'
+S3_BUCKET_VAR   = 'sparkify_bucket'
+S3_BUCKET_TPL   = '{{ var.value.sparkify_bucket }}'
+GLUE_SCRIPTS    = 'glue-scripts'
+LANDING_ROOT    = 'landing'
+RAW_SCRIPT      = f's3://{S3_BUCKET_TPL}/{GLUE_SCRIPTS}/raw/glue_script.py'
+CATALOG         = 'glue_catalog'
+RAW_DB          = 'raw'
 
-PIPELINE_REQUESTED = Asset('s3://sparkify/pipeline_requested')
+# ── Assets ─────────────────────────────────────────────────────────
+RAW_ASSET             = Asset('s3://sparkify/raw_complete')
+TRANSACTIONS_ASSET    = Asset('s3://sparkify/transactions_complete')
+ANALYTICS_ASSET       = Asset('s3://sparkify/analytics_complete')
+PIPELINE_REQUESTED    = Asset('s3://sparkify/pipeline_requested')
 
 
 def interval_from_context(**context):
@@ -51,33 +57,48 @@ with DAG(
     def selected_interval(**context):
         return interval_from_context(**context)
 
+    # ── Build dynamic SQL checks from discovered tables (no hardcoding) ──
+    @task
+    def build_raw_checks(meta):
+        """Generate one SQL check per discovered table — no hardcoded table names."""
+        checks = []
+        for table in meta['tables']:
+            checks.append({
+                'table': table,
+                'sql': f'SELECT count(*) AS cnt FROM {RAW_DB}.{table} HAVING count(*) > 0',
+            })
+        return checks
+
     meta = discover_tables()
     interval = selected_interval()
 
     run = GlueJobOperator(
         task_id='run_raw_glue',
         job_name='sparkify-raw',
-        script_location='s3://{{ var.value.sparkify_bucket }}/glue-scripts/raw/glue_script.py',
+        script_location=RAW_SCRIPT,
         iam_role_name='GlueServiceRole',
         aws_conn_id=AWS_CONN_ID,
         script_args={
-            '--BUCKET': '{{ var.value.sparkify_bucket }}',
+            '--BUCKET': S3_BUCKET_TPL,
             '--DATA_INTERVAL': '{{ ti.xcom_pull(task_ids="discover_tables")["data_interval"] }}',
             '--TABLES': '{{ ti.xcom_pull(task_ids="discover_tables")["tables"] | join(",") }}',
         },
         wait_for_completion=True,
     )
 
-    # SQL Check: verify raw.logs table is non-empty after Glue ingestion
-    check_raw = SQLCheckOperator(
-        task_id='check_raw_logs',
+    # ── Dynamic validation: one SQLCheckOperator per discovered table ──
+    checks = build_raw_checks(meta)
+
+    check_raw = SQLCheckOperator.partial(
+        task_id='check_raw_table',
         conn_id=ATHENA_CONN_ID,
-        sql="SELECT count(*) AS cnt FROM raw.logs HAVING count(*) > 0",
+    ).expand(
+        sql="{{ task.build_raw_checks.output | map(attribute='sql') | list }}",
     )
 
     @task(outlets=[RAW_ASSET])
     def emit_raw(data_interval, tables, *, outlet_events=None):
-        """Emit raw asset with metadata attached to the asset event."""
+        """Emit raw asset with both data_interval and tables in metadata."""
         payload = {'data_interval': data_interval, 'tables': tables}
         if outlet_events is not None:
             outlet_events[RAW_ASSET].extra = payload
