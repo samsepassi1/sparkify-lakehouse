@@ -5,11 +5,17 @@ from airflow.decorators import task
 from airflow.datasets import Dataset as Asset
 from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
 
-AWS_CONN_ID = 'aws_default'
-S3_BUCKET_VAR = 'sparkify_bucket'
-RAW_ASSET = Asset('s3://sparkify/raw_complete')
-TRANSACTIONS_ASSET = Asset('s3://sparkify/transactions_complete')
-ANALYTICS_ASSET = Asset('s3://sparkify/analytics_complete')
+# ── Centralized constants ──────────────────────────────────────────
+AWS_CONN_ID     = 'aws_default'
+S3_BUCKET_VAR   = 'sparkify_bucket'
+S3_BUCKET_TPL   = '{{ var.value.sparkify_bucket }}'
+GLUE_SCRIPTS    = 'glue-scripts'
+ANALYTICS_SCRIPT = f's3://{S3_BUCKET_TPL}/{GLUE_SCRIPTS}/analytics/glue_script.py'
+
+# ── Assets ─────────────────────────────────────────────────────────
+RAW_ASSET             = Asset('s3://sparkify/raw_complete')
+TRANSACTIONS_ASSET    = Asset('s3://sparkify/transactions_complete')
+ANALYTICS_ASSET       = Asset('s3://sparkify/analytics_complete')
 
 
 def interval_from_context(**context):
@@ -35,7 +41,6 @@ with DAG(
         return interval_from_context(**context)
 
     interval = selected_interval()
-    # Include user_facts — required by reviewer validation query
     tables = ['songplay_facts', 'user_activity_daily', 'artist_popularity', 'user_facts']
     prev = None
 
@@ -43,11 +48,11 @@ with DAG(
         op = GlueJobOperator(
             task_id=f'build_{t}',
             job_name='sparkify-analytics',
-            script_location='s3://{{ var.value.sparkify_bucket }}/glue-scripts/analytics/glue_script.py',
+            script_location=ANALYTICS_SCRIPT,
             iam_role_name='GlueServiceRole',
             aws_conn_id=AWS_CONN_ID,
             script_args={
-                '--BUCKET': '{{ var.value.sparkify_bucket }}',
+                '--BUCKET': S3_BUCKET_TPL,
                 '--SQL_FILE': f'sql/{t}.sql',
                 '--TABLE_NAME': t,
             },
@@ -60,11 +65,11 @@ with DAG(
         prev = op
 
     @task(outlets=[ANALYTICS_ASSET])
-    def emit_analytics(*, outlet_events=None):
-        """Emit analytics asset with metadata attached to the asset event."""
-        payload = {'tables': tables}
+    def emit_analytics(data_interval, *, outlet_events=None):
+        """Emit analytics asset with BOTH data_interval and tables."""
+        payload = {'data_interval': data_interval, 'tables': tables}
         if outlet_events is not None:
             outlet_events[ANALYTICS_ASSET].extra = payload
         return payload
 
-    prev >> emit_analytics()
+    prev >> emit_analytics(interval)
