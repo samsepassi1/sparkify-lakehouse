@@ -7,31 +7,31 @@ from pyspark.sql.functions import (
 )
 from pyspark.sql.window import Window
 
+CATALOG = 'glue_catalog'
+DATABASE = 'analytics'
+
 args = getResolvedOptions(sys.argv, ['BUCKET', 'SQL_FILE', 'TABLE_NAME'])
 
 spark = (
     SparkSession.builder
     .appName('sparkify-analytics')
     .config('spark.sql.extensions', 'org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions')
-    .config('spark.sql.catalog.glue_catalog', 'org.apache.iceberg.spark.GlueCatalog')
-    .config('spark.sql.catalog.glue_catalog.warehouse', f"s3://{args['BUCKET']}/warehouse")
-    .config('spark.sql.catalog.glue_catalog.catalog-impl', 'org.apache.iceberg.aws.glue.GlueCatalog')
-    .config('spark.sql.catalog.glue_catalog.io-impl', 'org.apache.iceberg.aws.s3.S3FileIO')
+    .config(f'spark.sql.catalog.{CATALOG}', 'org.apache.iceberg.spark.GlueCatalog')
+    .config(f'spark.sql.catalog.{CATALOG}.warehouse', f"s3://{args['BUCKET']}/warehouse")
+    .config(f'spark.sql.catalog.{CATALOG}.catalog-impl', 'org.apache.iceberg.aws.glue.GlueCatalog')
+    .config(f'spark.sql.catalog.{CATALOG}.io-impl', 'org.apache.iceberg.aws.s3.S3FileIO')
     .getOrCreate()
 )
 
 table_name = args['TABLE_NAME']
-# Use glue_catalog prefix so createOrReplace manages the table via the Iceberg catalog
-# without executing any SQL statements.
-target = f'glue_catalog.analytics.{table_name}'
+target = f'{CATALOG}.{DATABASE}.{table_name}'
 
-# Read source tables as DataFrames (NO SQL — pure PySpark DataFrame API)
-events_df = spark.table('glue_catalog.transactions.events')
-users_df = spark.table('glue_catalog.transactions.users')
-artists_df = spark.table('glue_catalog.transactions.artists')
+# Read source tables using fully qualified glue_catalog prefix (consistent with writes)
+events_df  = spark.table(f'{CATALOG}.transactions.events')
+users_df   = spark.table(f'{CATALOG}.transactions.users')
+artists_df = spark.table(f'{CATALOG}.transactions.artists')
 
 if table_name == 'songplay_facts':
-    # Filter to NextSong events and select fact columns
     df = (
         events_df
         .filter(col('page') == 'NextSong')
@@ -46,7 +46,6 @@ if table_name == 'songplay_facts':
     )
 
 elif table_name == 'user_activity_daily':
-    # Aggregate user activity by day using DataFrame operations
     df = (
         events_df
         .withColumn('activity_date', to_date(from_unixtime(col('ts') / 1000)))
@@ -59,7 +58,6 @@ elif table_name == 'user_activity_daily':
     )
 
 elif table_name == 'artist_popularity':
-    # Join events with artists and aggregate play counts
     df = (
         events_df
         .join(artists_df, on='artist_id', how='inner')
@@ -69,7 +67,6 @@ elif table_name == 'artist_popularity':
     )
 
 elif table_name == 'user_facts':
-    # User-level mart: join users with events, aggregate per user
     df = (
         users_df
         .join(events_df, on='user_id', how='left')
@@ -83,8 +80,8 @@ elif table_name == 'user_facts':
 else:
     raise ValueError(f'Unknown analytics table: {table_name}')
 
-# Overwrite full snapshot using DataFrameWriterV2 createOrReplace()
-# NO SQL statements (no spark.sql, no DROP TABLE, no CREATE DATABASE)
+# Full snapshot overwrite via DataFrameWriterV2 createOrReplace()
+# ZERO spark.sql() calls — no CREATE DATABASE, no DROP TABLE
 (
     df.writeTo(target)
       .using('iceberg')
